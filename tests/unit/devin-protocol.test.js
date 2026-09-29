@@ -79,6 +79,26 @@ describe("Devin protocol", () => {
     expect(payload.toString("utf8")).toContain("run");
   });
 
+  it("encodes user, assistant, and tool turns with distinct prompt sources", () => {
+    const payload = buildDevinChatRequest({
+      model: "swe-1-7",
+      apiKey: "token",
+      userJwt: "jwt",
+      sessionId: "s",
+      body: { messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "OK." },
+        { role: "assistant", content: null, tool_calls: [{ id: "call-1", function: { name: "run", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call-1", content: "done" },
+      ] },
+    });
+    const withSource = (id, source) => Buffer.concat([stringField(1, id), Buffer.from([0x10, source])]);
+    expect(payload.includes(withSource("s-0", 1))).toBe(true);
+    expect(payload.includes(withSource("bot-s-1", 2))).toBe(true);
+    expect(payload.includes(withSource("bot-s-2", 2))).toBe(true);
+    expect(payload.includes(withSource("s-3", 4))).toBe(true);
+  });
+
   it("decodes tool, usage, stop, and message deltas", () => {
     const tool = Buffer.concat([stringField(1, "call-1"), stringField(2, "run"), stringField(3, "{\"x\":1}")]);
     const usage = Buffer.from([0x10, 0x0a, 0x18, 0x14, 0x20, 0x02, 0x28, 0x01]);

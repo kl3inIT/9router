@@ -140,13 +140,18 @@ function encodeConfiguration(body) {
   ]);
 }
 
+// GetChatMessage prompt sources: 1 = user, 2 = assistant, 4 = tool result.
+const SOURCE_USER = 1;
+const SOURCE_ASSISTANT = 2;
+const SOURCE_TOOL = 4;
+
 function messageForWire(item) {
   if (item?.role === "system") return [];
-  if (item?.role === "user") return [{ role: 1, text: contentText(item.content) }];
-  if (item?.role === "tool") return [{ role: 4, text: contentText(item.content), toolCallId: item.tool_call_id }];
+  if (item?.role === "user") return [{ role: SOURCE_USER, text: contentText(item.content) }];
+  if (item?.role === "tool") return [{ role: SOURCE_TOOL, text: contentText(item.content), toolCallId: item.tool_call_id }];
   if (item?.role === "assistant" && Array.isArray(item.tool_calls)) {
     return [{
-      role: 1,
+      role: SOURCE_ASSISTANT,
       text: contentText(item.content),
       toolCalls: item.tool_calls.map((call) => ({
         id: call.id,
@@ -155,18 +160,19 @@ function messageForWire(item) {
       })),
     }];
   }
+  const role = item?.role === "assistant" ? SOURCE_ASSISTANT : SOURCE_USER;
   const output = [];
   for (const content of Array.isArray(item?.content) ? item.content : [{ type: "text", text: contentText(item?.content) }]) {
-    if (content?.type === "text") output.push({ role: 1, text: content.text });
-    else if (content?.type === "thinking") output.push({ role: 1, text: content.thinking });
-    else if (content?.type === "tool_use") output.push({ role: 1, text: "", toolCalls: [{ id: content.id, name: content.name, argumentsJson: JSON.stringify(content.input ?? {}) }] });
+    if (content?.type === "text") output.push({ role, text: content.text });
+    else if (content?.type === "thinking") output.push({ role, text: content.thinking });
+    else if (content?.type === "tool_use") output.push({ role, text: "", toolCalls: [{ id: content.id, name: content.name, argumentsJson: JSON.stringify(content.input ?? {}) }] });
   }
   return output;
 }
 
 function encodePrompt(item, id) {
   return Buffer.concat([
-    stringField(1, id),
+    stringField(1, item.role === SOURCE_ASSISTANT ? `bot-${id}` : id),
     varintField(2, BigInt(item.role)),
     stringField(3, item.text || ""),
     item.toolCallId ? stringField(7, item.toolCallId) : Buffer.alloc(0),
@@ -330,6 +336,7 @@ export class DevinExecutor extends BaseExecutor {
         let toolIndex = -1;
         let usage = null;
         let stopReason = 0;
+        let upstreamError = null;
         const emit = (value) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         try {
           const reader = upstream.body?.getReader();
@@ -340,8 +347,7 @@ export class DevinExecutor extends BaseExecutor {
             pending = complete.rest;
             for (const frame of complete.frames) {
               if (frame.trailer) {
-                const error = decodeDevinTrailer(frame.payload);
-                if (error) emit({ error: { message: error, type: "devin_error" } });
+                upstreamError = decodeDevinTrailer(frame.payload) || upstreamError;
                 continue;
               }
               for (const delta of decodeDevinChatDeltas(frame.payload)) {
@@ -363,6 +369,12 @@ export class DevinExecutor extends BaseExecutor {
               }
             }
             if (next.done) break;
+          }
+          if (upstreamError) {
+            // No success finish chunk: clients and combo fallback must see a failed turn.
+            emit({ error: { message: upstreamError, type: "devin_error" } });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            return;
           }
           const finish = toolIndex >= 0 ? "tool_calls" : stopReason === 1 || stopReason === 3 ? "length" : "stop";
           const final = chunk(responseId, model, {}, finish);

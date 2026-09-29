@@ -154,5 +154,6 @@ describe("Devin executor", () => {
     const output = await result.response.text();
     expect(output).toContain("quota exhausted");
     expect(output).toContain("[DONE]");
+    expect(output).not.toContain('"finish_reason"');
   });
 });
