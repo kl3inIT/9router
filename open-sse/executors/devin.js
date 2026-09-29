@@ -147,7 +147,7 @@ function messageForWire(item) {
   if (item?.role === "assistant" && Array.isArray(item.tool_calls)) {
     return [{
       role: 1,
-      text: "",
+      text: contentText(item.content),
       toolCalls: item.tool_calls.map((call) => ({
         id: call.id,
         name: call.function?.name || call.name || "tool",
@@ -192,7 +192,9 @@ function contentText(content) {
 
 function decodeTool(payload) {
   const values = new Map(decodeFields(payload).filter((field) => field.wire === 2).map((field) => [field.number, fieldText(field.value)]));
-  return { type: "tool", id: values.get(1) || crypto.randomUUID(), name: values.get(2) || "tool", argumentsJson: values.get(3) || "" };
+  // Devin streams a tool call as a header frame (id + name) followed by
+  // argument-only continuation frames, so id/name stay undefined when absent.
+  return { type: "tool", id: values.get(1), name: values.get(2), argumentsJson: values.get(3) || "" };
 }
 
 function decodeUsage(payload) {
@@ -323,7 +325,9 @@ export class DevinExecutor extends BaseExecutor {
       async start(controller) {
         const encoder = new TextEncoder();
         let pending = Buffer.alloc(0);
-        let toolCall = null;
+        // OpenAI index per upstream call id; argument-only frames go to toolIndex.
+        const toolIndexes = new Map();
+        let toolIndex = -1;
         let usage = null;
         let stopReason = 0;
         const emit = (value) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
@@ -344,15 +348,23 @@ export class DevinExecutor extends BaseExecutor {
                 if (delta.type === "text") emit(chunk(responseId, model, { content: delta.value }));
                 else if (delta.type === "thinking") emit(chunk(responseId, model, { reasoning_content: delta.value }));
                 else if (delta.type === "tool") {
-                  toolCall = delta;
-                  emit(chunk(responseId, model, { tool_calls: [{ index: 0, id: delta.id, type: "function", function: { name: delta.name, arguments: delta.argumentsJson } }] }));
+                  const known = delta.id ? toolIndexes.get(delta.id) : undefined;
+                  if (known === undefined && (delta.id || delta.name || toolIndex < 0)) {
+                    toolIndex = toolIndexes.size;
+                    const id = delta.id || `call_${crypto.randomUUID()}`;
+                    toolIndexes.set(id, toolIndex);
+                    emit(chunk(responseId, model, { tool_calls: [{ index: toolIndex, id, type: "function", function: { name: delta.name || "tool", arguments: delta.argumentsJson } }] }));
+                  } else {
+                    if (known !== undefined) toolIndex = known;
+                    if (delta.argumentsJson) emit(chunk(responseId, model, { tool_calls: [{ index: toolIndex, function: { arguments: delta.argumentsJson } }] }));
+                  }
                 } else if (delta.type === "usage") usage = delta;
                 else if (delta.type === "stop") stopReason = delta.reason;
               }
             }
             if (next.done) break;
           }
-          const finish = toolCall ? "tool_calls" : stopReason === 1 || stopReason === 3 ? "length" : "stop";
+          const finish = toolIndex >= 0 ? "tool_calls" : stopReason === 1 || stopReason === 3 ? "length" : "stop";
           const final = chunk(responseId, model, {}, finish);
           if (usage) final.usage = { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, cache_read_input_tokens: usage.cacheRead, cache_creation_input_tokens: usage.cacheWrite };
           emit(final);

@@ -56,6 +56,45 @@ describe("Devin executor", () => {
     expect(output).toContain("[DONE]");
   });
 
+  it("assembles streamed argument fragments and parallel tool calls by index", async () => {
+    const header = (id, name) => messageField(6, Buffer.concat([stringField(1, id), stringField(2, name)]));
+    const args = (text) => messageField(6, stringField(3, text));
+    global.fetch = vi.fn(async (url) => {
+      if (String(url).includes("GetUserJwt")) return new Response(stringField(1, "jwt"), { status: 200 });
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const payload of [header("call_a", "get_weather"), args("{\"city\": "), header("call_b", "get_time"), args("{\"city\": \"Hanoi\"}"), messageField(6, Buffer.concat([stringField(1, "call_a"), stringField(3, "\"Hanoi\"}")]))]) {
+            controller.enqueue(frameDevinConnect(payload));
+          }
+          controller.close();
+        },
+      }), { status: 200 });
+    });
+
+    const result = await new DevinExecutor().execute({
+      fetchImpl: global.fetch,
+      model: "swe-1-6",
+      body: { messages: [{ role: "user", content: "hi" }], tools: [] },
+      stream: true,
+      credentials: { accessToken: "token" },
+    });
+    const calls = [];
+    for (const line of (await result.response.text()).split("\n")) {
+      if (!line.startsWith("data: {")) continue;
+      for (const tc of JSON.parse(line.slice(6)).choices?.[0]?.delta?.tool_calls || []) {
+        const call = (calls[tc.index] ??= { id: "", name: "", arguments: "" });
+        call.id += tc.id || "";
+        call.name += tc.function?.name || "";
+        call.arguments += tc.function?.arguments || "";
+      }
+    }
+
+    expect(calls).toEqual([
+      { id: "call_a", name: "get_weather", arguments: "{\"city\": \"Hanoi\"}" },
+      { id: "call_b", name: "get_time", arguments: "{\"city\": \"Hanoi\"}" },
+    ]);
+  });
+
   it("maps tool calls and usage into the SSE stream", async () => {
     global.fetch = vi.fn(async (url) => {
       if (String(url).includes("GetUserJwt")) return new Response(stringField(1, "jwt"), { status: 200 });
