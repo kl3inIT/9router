@@ -99,6 +99,20 @@ describe("Devin protocol", () => {
     expect(payload.includes(withSource("s-3", 4))).toBe(true);
   });
 
+  it("sends parallel, tool_choice, strict, and developer-role settings", () => {
+    const tools = [{ type: "function", function: { name: "run", strict: true, parameters: {} } }];
+    const build = (extra) => buildDevinChatRequest({ model: "swe-1-7", apiKey: "token", userJwt: "jwt", body: { messages: [{ role: "user", content: "hi" }], tools, ...extra } });
+    const parallelOff = Buffer.from([0x58, 0x01]); // field 11 = 1
+    expect(build({}).includes(parallelOff)).toBe(false);
+    expect(build({ parallel_tool_calls: false }).includes(parallelOff)).toBe(true);
+    expect(build({ tool_choice: "required" }).includes(messageField(12, stringField(1, "required")))).toBe(true);
+    expect(build({ tool_choice: { type: "function", function: { name: "run" } } }).includes(messageField(12, stringField(2, "run")))).toBe(true);
+    expect(build({}).includes(Buffer.from([0x60, 0x01]))).toBe(true); // tool strict flag (field 12)
+    const withDeveloper = buildDevinChatRequest({ model: "swe-1-7", apiKey: "token", userJwt: "jwt", body: { messages: [{ role: "developer", content: "be terse" }, { role: "user", content: "hi" }] } });
+    expect(withDeveloper.includes(stringField(2, "be terse"))).toBe(true);
+    expect(withDeveloper.includes(stringField(3, "be terse"))).toBe(false);
+  });
+
   it("decodes tool, usage, stop, and message deltas", () => {
     const tool = Buffer.concat([stringField(1, "call-1"), stringField(2, "run"), stringField(3, "{\"x\":1}")]);
     const usage = Buffer.from([0x10, 0x0a, 0x18, 0x14, 0x20, 0x02, 0x28, 0x01]);

@@ -81,6 +81,7 @@ export function buildDevinChatRequest({ model, body = {}, apiKey, userJwt, sessi
     .flatMap(messageForWire)
     .map((item, index) => message(3, encodePrompt(item, `${sessionId}-${index}`)));
   const tools = (Array.isArray(body.tools) ? body.tools : []).map(encodeTool);
+  const toolChoice = encodeToolChoice(body.tool_choice);
   return Buffer.concat([
     message(1, encodeMetadata(normalizeDevinSessionToken(apiKey), userJwt)),
     systemText(body),
@@ -88,7 +89,9 @@ export function buildDevinChatRequest({ model, body = {}, apiKey, userJwt, sessi
     varintField(7, 5n),
     message(8, encodeConfiguration(body)),
     ...tools.map((tool) => message(10, tool)),
-    varintField(11, 1n),
+    // Field 11 disables parallel tool calls; only send it when the client asks.
+    body.parallel_tool_calls === false ? varintField(11, 1n) : Buffer.alloc(0),
+    toolChoice ? message(12, toolChoice) : Buffer.alloc(0),
     stringField(16, sessionId),
     stringField(17, crypto.randomUUID()),
     varintField(20, 1n),
@@ -119,7 +122,7 @@ function systemText(body) {
   const text = typeof body.system === "string"
     ? body.system
     : Array.isArray(body.messages)
-      ? body.messages.filter((item) => item?.role === "system").map((item) => contentText(item.content)).join("\n")
+      ? body.messages.filter((item) => item?.role === "system" || item?.role === "developer").map((item) => contentText(item.content)).join("\n")
       : "";
   return text ? stringField(2, text) : Buffer.alloc(0);
 }
@@ -146,7 +149,7 @@ const SOURCE_ASSISTANT = 2;
 const SOURCE_TOOL = 4;
 
 function messageForWire(item) {
-  if (item?.role === "system") return [];
+  if (item?.role === "system" || item?.role === "developer") return [];
   if (item?.role === "user") return [{ role: SOURCE_USER, text: contentText(item.content) }];
   if (item?.role === "tool") return [{ role: SOURCE_TOOL, text: contentText(item.content), toolCallId: item.tool_call_id }];
   if (item?.role === "assistant" && Array.isArray(item.tool_calls)) {
@@ -188,7 +191,15 @@ function encodeTool(tool) {
     stringField(1, value?.name || "tool"),
     stringField(2, String(value?.description || "").slice(0, 6998)),
     stringField(3, JSON.stringify(value?.parameters || value?.input_schema || {}) || "{}"),
+    value?.strict === true ? varintField(12, 1n) : Buffer.alloc(0),
   ]);
+}
+
+// OpenAI tool_choice → ChatToolChoice: 1 = option name (auto/none/required), 2 = forced tool name.
+function encodeToolChoice(choice) {
+  if (choice === "auto" || choice === "none" || choice === "required") return stringField(1, choice);
+  const name = choice?.type === "function" ? choice.function?.name : undefined;
+  return typeof name === "string" && name ? stringField(2, name) : null;
 }
 
 function contentText(content) {
@@ -322,10 +333,12 @@ export class DevinExecutor extends BaseExecutor {
     const transformedBody = frameDevinConnect(buildDevinChatRequest({ model, body, apiKey: token, userJwt, sessionId: credentials?.rawHeaders?.["x-session-id"] }));
     const upstream = await fetchImpl(url, { method: "POST", headers, body: transformedBody, signal });
     if (!upstream.ok) return { response: upstream, url, headers, transformedBody };
-    return { response: this.transformToSSE(upstream, model), url, headers, transformedBody };
+    return { response: this.transformToSSE(upstream, model, { singleToolCall: body?.parallel_tool_calls === false }), url, headers, transformedBody };
   }
 
-  transformToSSE(upstream, model) {
+  // singleToolCall: the upstream ignores field 11 in practice, so honor
+  // parallel_tool_calls:false here by forwarding only the first tool call.
+  transformToSSE(upstream, model, { singleToolCall = false } = {}) {
     const responseId = `chatcmpl-devin-${Date.now()}`;
     const stream = new ReadableStream({
       async start(controller) {
@@ -337,6 +350,7 @@ export class DevinExecutor extends BaseExecutor {
         let usage = null;
         let stopReason = 0;
         let upstreamError = null;
+        let sawTrailer = false;
         const emit = (value) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         try {
           const reader = upstream.body?.getReader();
@@ -347,6 +361,7 @@ export class DevinExecutor extends BaseExecutor {
             pending = complete.rest;
             for (const frame of complete.frames) {
               if (frame.trailer) {
+                sawTrailer = true;
                 upstreamError = decodeDevinTrailer(frame.payload) || upstreamError;
                 continue;
               }
@@ -355,7 +370,14 @@ export class DevinExecutor extends BaseExecutor {
                 else if (delta.type === "thinking") emit(chunk(responseId, model, { reasoning_content: delta.value }));
                 else if (delta.type === "tool") {
                   const known = delta.id ? toolIndexes.get(delta.id) : undefined;
-                  if (known === undefined && (delta.id || delta.name || toolIndex < 0)) {
+                  const opensCall = known === undefined && (delta.id || delta.name || toolIndex < 0);
+                  if (singleToolCall && (opensCall ? toolIndexes.size > 0 : (known ?? toolIndex) > 0)) {
+                    // Track extra calls so their argument frames are skipped too.
+                    if (opensCall) { toolIndex = toolIndexes.size; toolIndexes.set(delta.id || `call_${crypto.randomUUID()}`, toolIndex); }
+                    else if (known !== undefined) toolIndex = known;
+                    continue;
+                  }
+                  if (opensCall) {
                     toolIndex = toolIndexes.size;
                     const id = delta.id || `call_${crypto.randomUUID()}`;
                     toolIndexes.set(id, toolIndex);
@@ -370,13 +392,16 @@ export class DevinExecutor extends BaseExecutor {
             }
             if (next.done) break;
           }
+          if (!upstreamError && (pending.length || !sawTrailer)) {
+            upstreamError = "Devin stream ended without a Connect end-stream frame";
+          }
           if (upstreamError) {
             // No success finish chunk: clients and combo fallback must see a failed turn.
             emit({ error: { message: upstreamError, type: "devin_error" } });
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             return;
           }
-          const finish = toolIndex >= 0 ? "tool_calls" : stopReason === 1 || stopReason === 3 ? "length" : "stop";
+          const finish = mapFinishReason(stopReason, toolIndexes.size > 0);
           const final = chunk(responseId, model, {}, finish);
           if (usage) final.usage = { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, cache_read_input_tokens: usage.cacheRead, cache_creation_input_tokens: usage.cacheWrite };
           emit(final);
@@ -391,6 +416,14 @@ export class DevinExecutor extends BaseExecutor {
     });
     return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
   }
+}
+
+// Stop reasons as observed on the Devin Desktop wire: 3 = max tokens, 10 = tool use, 11 = content filter.
+function mapFinishReason(stopReason, hasToolCalls) {
+  if (hasToolCalls || stopReason === 10) return "tool_calls";
+  if (stopReason === 3) return "length";
+  if (stopReason === 11) return "content_filter";
+  return "stop";
 }
 
 function chunk(id, model, delta, finishReason = null) {
